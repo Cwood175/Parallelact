@@ -47,11 +47,11 @@ Important flags:
 | --- | --- | --- |
 | `--addr` | `127.0.0.1:8080` | HTTP listen address |
 | `--data-dir` | `<cache>/serve` | logs, per-run caches, artifacts |
-| `--max-containers` | `20` | global cap of job containers; the host launcher defaults to 10 and can override via `PACT_MAX_CONTAINERS` (24 in the current campaign) |
+| `--max-containers` | `20` | global cap of job containers (`PACT_MAX_CONTAINERS` in `deploy/start-serve.sh`) |
 | `--workers` | `max-containers + 8` | worker goroutines executing jobs |
 | `--job-cpus` | `4` | CPU budget of every job container (quota, affinity window, thread pool env); `0` disables it |
 | `--max-queued-runs` | `100` | admitted (queued + running) runs |
-| `--max-units-per-run` | `200` | job instances per run (current deployment: 300) |
+| `--max-units-per-run` | `200` | job instances per run |
 | `--run-timeout` | `0` | default timeout of a run |
 | `--allowed-workdir-roots` | current directory | comma separated roots a request may execute |
 | `--api-token` | – | bearer token, required for non loopback addresses |
@@ -150,7 +150,7 @@ already defines the same variable.
   rotating 4-CPU affinity window and sets common thread pool variables. It only
   applies to job containers, not to service containers or host mode jobs. Set it
   to `0` when the Docker daemon is remote and its CPU ids may not match.
-- Job containers default to `--network bridge` in the current deployment, using
+- Job containers use `--network` (default `host`). With `bridge`, take care of
   docker0 (`192.168.0.0/24` here), not 172.x. With bridge the artifact server
   must listen on a host address reachable from the container (the docker0
   gateway), not `127.0.0.1`. Jobs with `services` get a per-job bridge network.

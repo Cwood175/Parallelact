@@ -217,7 +217,7 @@ act 是一个在本地用 Docker 执行 GitHub Actions workflow 的命令行工�
    `PYTEST_XDIST_AUTO_NUM_WORKERS`、`PYTHON_CPU_COUNT`，值都是 N。
 
 该限制只作用于 job 容器，不作用于 service 容器。调度器最多占用 `max-containers × job-cpus`
-个核（默认 80，当前部署 40）。Docker daemon 在远端机器、CPU 编号可能不一致时，应设
+个核（默认 20×4=80）。Docker daemon 在远端机器、CPU 编号可能不一致时，应设
 `--job-cpus 0`。
 
 ### 3.5 结果判定
@@ -432,7 +432,7 @@ GitHub；它还会在启动时尝试通过 `gh` 读取 `GITHUB_TOKEN`。配置�
 
 - 在启动 `act serve` 前给进程设置 `http_proxy` / `https_proxy` 环境变量；
 - 使用 4.1 的离线方案（`--action-offline-mode` + `--local-repository`），让 action 不必出网
-  （当前部署采用这种方式，见第 9 章）。
+  （见第 9 章的示例部署）。
 
 **（2）job 容器内部**。`pip install`、`npm install`、`apt-get`、`setup-*` 的下载都在容器里进行，
 宿主的代理变量不会自动进去。需要通过 `--env` 传给 job：
@@ -641,7 +641,7 @@ cp pkg/scheduler/testdata/concurrent/workflow.yml \
 ```bash
 mkdir -p /tmp/act-qs/data
 ./dist/local/act serve \
-  --addr 127.0.0.1:18181 \
+  --addr 127.0.0.1:8080 \
   --data-dir /tmp/act-qs/data \
   --max-containers 4 \
   --allowed-workdir-roots /tmp/act-qs \
@@ -652,7 +652,7 @@ mkdir -p /tmp/act-qs/data
 
 ```
 level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket 'unix:///var/run/docker.sock'"
-level=info msg="act scheduler listening on http://127.0.0.1:18181 (max 4 containers, data dir /tmp/act-qs/data)"
+level=info msg="act scheduler listening on http://127.0.0.1:8080 (max 4 containers, data dir /tmp/act-qs/data)"
 level=info msg="Start server on http://127.0.0.1:34567"
 ```
 
@@ -670,7 +670,7 @@ level=info msg="Start server on http://127.0.0.1:34567"
 
 ```bash
 ./dist/local/act submit \
-  --addr http://127.0.0.1:18181 \
+  --addr http://127.0.0.1:8080 \
   --workdir /tmp/act-qs/repo \
   --repo demo/concurrent \
   --commit 0000000 \
@@ -685,8 +685,8 @@ workdir 不是 git 仓库时日志里会出现 `unable to get git revision`，�
 
 ```
 Submitted run r20261104T03161989d00726 (status queued)
-  inspect: http://127.0.0.1:18181/v1/runs/r20261104T03161989d00726
-  cancel:  curl -X POST http://127.0.0.1:18181/v1/runs/r20261104T03161989d00726/cancel
+  inspect: http://127.0.0.1:8080/v1/runs/r20261104T03161989d00726
+  cancel:  curl -X POST http://127.0.0.1:8080/v1/runs/r20261104T03161989d00726/cancel
 
 Run r20261104T03161989d00726 finished: success
   Concurrent/first/0                       success
@@ -695,7 +695,7 @@ Run r20261104T03161989d00726 finished: success
   Concurrent/matrix/2                      success
   Concurrent/second/0                      success
 
-Logs: http://127.0.0.1:18181/v1/runs/r20261104T03161989d00726/logs
+Logs: http://127.0.0.1:8080/v1/runs/r20261104T03161989d00726/logs
 ```
 
 （workflow 名取自 YAML 顶部的 `name: Concurrent`。）
@@ -703,7 +703,7 @@ Logs: http://127.0.0.1:18181/v1/runs/r20261104T03161989d00726/logs
 或者直接用 curl：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:18181/v1/runs \
+curl -sS -X POST http://127.0.0.1:8080/v1/runs \
   -H 'Content-Type: application/json' \
   -d '{
         "repo": "demo/concurrent",
@@ -722,11 +722,11 @@ curl -sS -X POST http://127.0.0.1:18181/v1/runs \
 ```bash
 ID=r20261104T03161989d00726         # 用上面返回的 id
 
-curl -sS http://127.0.0.1:18181/v1/runs/$ID          # Run 详情与每个 job 实例状态
-curl -sS http://127.0.0.1:18181/v1/stats             # 队列 / 容器计数
-curl -sS http://127.0.0.1:18181/v1/runs/$ID/logs     # 日志文件清单
-curl -sS 'http://127.0.0.1:18181/v1/runs/'$ID'/logs?job=Concurrent/first/0'
-curl -sS 'http://127.0.0.1:18181/v1/runs/'$ID'/logs?job=Concurrent/first/0&follow=1'  # 边跑边看
+curl -sS http://127.0.0.1:8080/v1/runs/$ID          # Run 详情与每个 job 实例状态
+curl -sS http://127.0.0.1:8080/v1/stats             # 队列 / 容器计数
+curl -sS http://127.0.0.1:8080/v1/runs/$ID/logs     # 日志文件清单
+curl -sS 'http://127.0.0.1:8080/v1/runs/'$ID'/logs?job=Concurrent/first/0'
+curl -sS 'http://127.0.0.1:8080/v1/runs/'$ID'/logs?job=Concurrent/first/0&follow=1'  # 边跑边看
 ```
 
 `/v1/runs/{id}/logs` 返回的是**文件名**列表，key 里的 `/` 已经换成 `-`：
@@ -753,7 +753,7 @@ curl -sS 'http://127.0.0.1:18181/v1/runs/'$ID'/logs?job=Concurrent/first/0&follo
 ### 8.6 取消与停止
 
 ```bash
-curl -sS -X POST http://127.0.0.1:18181/v1/runs/$ID/cancel
+curl -sS -X POST http://127.0.0.1:8080/v1/runs/$ID/cancel
 kill -TERM <act serve 的 pid>    # 进入 draining，取消活动 Run，清理容器后退出
 ```
 
@@ -763,7 +763,7 @@ kill -TERM <act serve 的 pid>    # 进入 draining，取消活动 Run，清理�
 import time
 import requests
 
-BASE = "http://127.0.0.1:18181"
+BASE = "http://127.0.0.1:8080"
 HEADERS = {"Authorization": "Bearer <token>"}   # 未设置 --api-token 时留空
 
 resp = requests.post(f"{BASE}/v1/runs", headers=HEADERS, json={

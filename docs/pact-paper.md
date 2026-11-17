@@ -5,7 +5,7 @@
 本文描述 PACT（Parallel ACT）的系统设计、执行流水线与实测性能。PACT 构建在 nektos/act 之上，
 把原本"一次进程执行一份 Plan"的本地 Actions 运行器，扩展为可接收多仓库、多 commit、
 多 workflow 请求的常驻调度服务。文中所有实现均对应本仓库代码，所有性能数据来自
-fixbench campaign 的实测记录（数据文件与统计口径见 3.1）。
+一组 CI 回归任务的实测记录（统计口径见 3.1）。
 
 ---
 
@@ -357,11 +357,11 @@ curl -sS -X POST http://127.0.0.1:8080/v1/runs \
 - 宿主：104 vCPU、493 GB 内存；Docker 29.7（overlayfs）；`/srv` 存储。
 - 调度器：`--max-containers 24`、`--job-cpus 4`、bridge 网络、`--container-daemon-socket -`；
   runner 镜像 `catthehacker/ubuntu:act-latest`（预置 Go/Python/Node/Java 多版本 toolcache）。
-- 数据：fixbench campaign 的 5597 个已完成任务（inventory 5706，109 条 error）；每任务时间取
+- 数据：5597 个已完成任务（inventory 5706，109 条 error）；每任务时间取
   配套实验仓库导出的 `state.jsonl` 中 `act_sec`（run 从 `createdAt` 到 `finishedAt` 的墙钟，
   见 3.6 口径说明）。实验代码与原始数据不在本仓库发布。
 - 吞吐统计只采用未被中断的轮次（round 1/3/6/7）；round 2 有多次 rerun、round 4 曾中断重跑、
-  round 8 受磁盘写满与 serve 重启影响，均不计入吞吐对比，单独说明。
+  round 8 受运行环境中断影响，均不计入吞吐对比，单独说明。
 
 ### 3.2 吞吐量与容器利用率
 
@@ -436,7 +436,7 @@ PACT 的差异：
 ### 3.6 开销与瓶颈
 
 - **toolcache copy-up**：v2 镜像的 `/opt/hostedtoolcache` 约 5.6 GB，每个 job 的独立卷首次挂载
-  需要复制一次；24 并发时产生百余 GB 的临时占用与 I/O，是本轮磁盘压力的主要来源。部署通过
+  需要复制一次；24 并发时产生百余 GB 的临时占用与 I/O，是磁盘压力的主要来源。部署通过
   `--shared-toolcache` 将复制降为一次，代价是并发安装同一工具的隔离性下降。
 - **每 Run 一个 cache server**：并发 Run 数增加时端口与进程数线性增长（随机端口），对吞吐影响
   较小，但增加了运维复杂度。

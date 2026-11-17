@@ -2,8 +2,8 @@
 
 本仓库在 [nektos/act](https://github.com/nektos/act) 的基础上增加了一个常驻调度器：
 它通过 HTTP 接收多个仓库、多个 commit 的多份 workflow 请求，把每个 job 实例放到
-独立容器里并行执行，并保证全局容器数不超过给定上限（`--max-containers`，代码默认
-20；当前部署脚本默认 10，本轮 campaign 通过 `PACT_MAX_CONTAINERS=24` 启动）。
+独立容器里并行执行，并保证全局容器数不超过给定上限（`--max-containers`，默认 20，
+可用 `PACT_MAX_CONTAINERS` 或同名参数调整）。
 
 原始 act 一次进程调用只能跑一份 plan，且 plan 内 stage 串行；本改造在保留原有
 CLI 接口的前提下，把「单个 job 实例」抽成可独立调度和执行的单元。默认行为有三处
@@ -12,7 +12,7 @@ CLI 接口的前提下，把「单个 job 实例」抽成可独立调度和执�
 
 - 面向调用者的完整用法：[第 4 章](#4-调用者使用说明)
 - 设计/实现细节：[第 2 章](#2-实现原理)
-- 多任务实测结果：[第 5 章](#5-多任务实测fixbench)
+- 多任务实测结果：[第 5 章](#5-多任务实测)
 
 调用结果分为两层，职责不同：
 
@@ -32,7 +32,7 @@ job 日志后生成，见 4.3.4。这样调度器的核心结论不会被模型�
 2. [实现原理](#2-实现原理)
 3. [Quickstart](#3-quickstart)
 4. [调用者使用说明](#4-调用者使用说明)
-5. [多任务实测（fixbench）](#5-多任务实测fixbench)
+5. [多任务实测](#5-多任务实测)
 6. [代码索引](#6-代码索引)
 
 ---
@@ -92,8 +92,7 @@ CI 场景里同时到达的通常是「多个仓库 × 多个 commit」的验证
           └─ job executor 最外层无条件 Finally ──Release 槽
 ```
 
-**运行形态**：`act serve` 只是 Docker API 客户端，本身不要求 DinD。推荐（也是当前部署）
-在宿主机直接运行，通过 `/var/run/docker.sock` 创建兄弟容器；如果要把 act 放进容器，
+**运行形态**：`act serve` 只是 Docker API 客户端，本身不要求 DinD。推荐在宿主机直接运行，通过 `/var/run/docker.sock` 创建兄弟容器；如果要把 act 放进容器，
 应挂载宿主 socket（Docker-out-of-Docker），而不是在内层再起一个 dockerd。DinD 也能用
 （`DOCKER_HOST` 指向内层 daemon），但 CPU 编号、路径映射、清理边界都会不同，详见 4.9。
 
@@ -296,8 +295,8 @@ service 网络。但它可能被跳过：`docker create` 之后、`docker start`
 
 > 重要：未启用离线模式时，action 的 `git clone` 发生在**守护进程（宿主机）**里；
 > 容器内 action 的下载/安装走 job 环境变量。两处都需要网络（见
-> [4.8](#48-日志数据目录与排障)）。当前部署使用 `--action-offline-mode` +
-> `--local-repository`，action 从本地读取，但步骤内的下载仍需要代理。
+> [4.8](#48-日志数据目录与排障)）。也可以使用 `--action-offline-mode` +
+> `--local-repository`，让 action 从本地目录读取，但步骤内的下载仍需要网络。
 
 ### 3.2 构建
 
@@ -376,11 +375,11 @@ kill -TERM <pid>    # 取消活动 run，清理容器，然后退出
 | --- | --- | --- |
 | `--addr` | `127.0.0.1:8080` | HTTP 监听地址 |
 | `--data-dir` | `~/.cache/serve` | 日志、cache、artifact 根目录 |
-| `--max-containers` | `20` | **全局**同时运行的 job 容器上限；当前部署脚本用 `PACT_MAX_CONTAINERS` 覆盖（默认 10，本轮 campaign 为 24） |
+| `--max-containers` | `20` | **全局**同时运行的 job 容器上限 |
 | `--workers` | `max-containers + 8` | 执行 job 的 worker 数（不再随宿主核心数放大） |
 | `--job-cpus` | `4` | 每个 job 容器的 CPU 预算（quota + 亲和性窗口 + 线程池默认值），0 = 不限制；亲和窗口仅 Linux（远端 daemon 见 4.9） |
 | `--max-queued-runs` | `100` | 排队 + 运行中的 run 数上限，超出返回 503 |
-| `--max-units-per-run` | `200` | 单个 run 的 job 实例上限，超出则 run 失败；当前部署为 300 |
+| `--max-units-per-run` | `200` | 单个 run 的 job 实例上限，超出则 run 失败 |
 | `--run-timeout` | `0` | run 默认超时（0 = 不限） |
 | `--allowed-workdir-roots` | 当前目录 | 允许执行的 checkout 根目录，逗号分隔 |
 | `--api-token` | 空 | Bearer token；监听非 loopback 地址时必填 |
@@ -388,7 +387,7 @@ kill -TERM <pid>    # 取消活动 run，清理容器，然后退出
 | `--shared-toolcache` | `false` | 所有 run 共享 `act-toolcache` 卷 |
 | `--per-run-action-cache` | `false` | 每 run 独立的 action 缓存目录（见下方说明） |
 | `--allow-bind-workdir` | `false` | 允许 `--bind`（默认禁止，避免并发写宿主目录） |
-| `--keep-runs` | `0` | 内存中保留的已结束 run 数，0 = 全部保留；当前部署为 1000 |
+| `--keep-runs` | `0` | 内存中保留的已结束 run 数，0 = 全部保留 |
 | `--artifact-server-dir` | `<data-dir>/artifacts` | artifact 存储目录 |
 | `--cleanup-interval` | `15s` | janitor 检查到期清理的周期 |
 | `--cleanup-grace` | `45s` | run 结束后延迟多久清理遗留 docker 资源 |
@@ -842,8 +841,8 @@ act submit \
   在上限内；有实例结束后立即补位（实测 22 个实例 / 上限 20：峰值恰好 20）。
 - 容量建议：容器上限 ≈ 机器能同时承受的 CPU/内存压力；worker 默认值足够，
   因为阻塞槽位的 worker 不消耗 CPU。
-- **CPU 预算**：`max-containers × job-cpus`（代码默认 20×4=80；当前部署脚本默认
-  10×4=40，本轮 campaign 为 24×4=96）是调度器最多占用的核数；每个 job 的 CPU
+- **CPU 预算**：`max-containers × job-cpus`（默认 20×4=80）是调度器最多占用的
+  核数；每个 job 的 CPU
   亲和性是轮转的 4 核窗口（如 `0-3`、`4-7`……），既限制实际用量，也让容器内
   `nproc` 等接口报告 4。若刻意让 job 使用更多核，可调大该值；设为 0 则恢复为
   不限制（容器看到全部宿主核）。当 `max-containers × job-cpus` 超过可用核数时，
@@ -865,9 +864,9 @@ act submit \
   `GITHUB_RUN_ID`（会被拒绝）。
 - **Docker socket**：act 默认把 Docker daemon socket 挂进 job 容器
   （`--container-daemon-socket` 未设置为 `-` 时；宿主机直跑时即宿主
-  `/var/run/docker.sock`）。当前部署使用 `--container-daemon-socket -`，**不挂载**
-  socket，因此 workflow 里的 `docker`/依赖 Docker 的 action 会失败；这类失败属于
-  环境侧，不应被当成代码业务失败。若需要支持 Docker-in-workflow，需要显式放开
+  `/var/run/docker.sock`）。可以用 `--container-daemon-socket -` 关闭挂载，此时
+  workflow 里的 `docker`/依赖 Docker 的 action 会失败；这类失败属于环境侧，不应被
+  当成代码业务失败。若需要支持 Docker-in-workflow，需要显式放开
   socket，并注意这些兄弟容器不受 `--max-containers` 统计，也不会随 run 清理。
 - **信任边界**：workflow 内的命令会在宿主机 Docker 上以容器 root 执行，能访问
   容器网络与挂载；只应接受可信仓库的请求。`--allowed-workdir-roots` 限制的是
@@ -880,11 +879,10 @@ act submit \
 - 日志接口按 job key 读取；`offset` 单位是字节，`follow=1` 会持续 tail，直到 run
   进入终态且读完文件。对已结束的 run 使用 `follow=1` 会立即返回。
 - **action 获取**：默认由守护进程执行 `☁ git clone ...`，因此 `act serve` 本身要能
-  访问 GitHub（或代理）。若启用 `--action-offline-mode` + `--local-repository`
-  （当前部署的做法），已映射的 action 全部从本地目录读取，守护进程无需联网。
-- **容器内下载**：action（如 `setup-python`）与 `pip/npm/apt` 在容器内执行。当前
-  部署使用宿主机透明代理，默认**不注入** `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`
-  （显式代理可用 `PACT_EXPLICIT_PROXY=1` 恢复）；需要显式代理时仍可给 `serve`
+  访问 GitHub（或代理）。若启用 `--action-offline-mode` + `--local-repository`，
+  已映射的 action 全部从本地目录读取，守护进程无需联网。
+- **容器内下载**：action（如 `setup-python`）与 `pip/npm/apt` 在容器内执行，
+  默认**不注入** `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`；需要显式代理时给 `serve`
   加 `--env http_proxy=... --env https_proxy=...`（以及大写形式），并建议同时设置
   `no_proxy/NO_PROXY` 排除本机 cache/artifact 地址。调度器会把
   `serve --env` 中名字包含 `PROXY` 的变量，以及 `NODE_USE_ENV_PROXY`、
@@ -899,15 +897,11 @@ act submit \
   配置错误时，常见表现是 job 长时间停在下载步骤，或出现 `Proxy CONNECT aborted`、
   `statusCode=407`、`Could not resolve host` 等网络错误；这些应归为环境失败。
 - **代理凭据**：不要把代理 URL（含用户名/密码）、token 或 API key 写进请求、
-  workflow、日志或文档。透明代理部署不需要在 `act.env` 中写代理变量；只有显式
-  代理模式才从 0600 的 `.proxy` 读取，README 和示例只使用占位符。
-- **宿主机直跑的网络**：当前默认 `network=bridge`，普通 job 使用 Docker 默认
-  bridge `docker0`（当前 `192.168.0.0/24`，网关 `192.168.0.1`），不使用
-  172.x 网段；有 `services` 的 job 仍由 act 创建每 job 独立网络。bridge 下 job
-  不能访问宿主机 loopback，artifact server 因此监听 docker0 网关；cache server
-  使用宿主机 outbound IP。若改回 `network=host`，artifact server 应使用
-  `127.0.0.1`。host 网络下所有 job 共享宿主端口空间，固定端口会冲突；bridge
-  下每个 job 有独立网络命名空间。某些域名可能只解析到 IPv6 而宿主机 IPv6 不通，
+  workflow、日志或文档；README 和示例只使用占位符。
+- **宿主机直跑的网络**：`--network` 默认是 `host`；普通 job 直接共享宿主网络，
+  固定端口会冲突。使用 `bridge` 时每个 job 有独立网络命名空间，但 job 容器不能
+  访问宿主机 loopback，此时 artifact server 需监听容器可达地址（例如 docker0
+  网关），cache server 使用宿主机 outbound IP。某些域名可能只解析到 IPv6 而宿主机 IPv6 不通，
   表现为 curl 失败或 Node `fetch failed`；给 job 配代理（上一节）可以规避。
 - 常见现象：
   - `400 unknown field`：请求里有拼错的字段（API 拒绝未知字段）。
@@ -927,12 +921,12 @@ act submit \
 - 同一 run 的 stage 之间严格串行；即使后一 stage 的 job 与前一 stage 无依赖，
   也不会提前执行（与 act 的 plan 语义一致）。
 - 请求必须指向本地已 checkout 的目录，调度器不做 clone/fetch。
-- 当前部署为「宿主机直跑 act + 宿主 Docker」，不是 DinD；job 容器使用
-  `--container-daemon-socket -`，不挂载 Docker socket。若把 act 放进容器，推荐
+- 推荐「宿主机直跑 act + 宿主 Docker」，不是 DinD；可以选用
+  `--container-daemon-socket -` 不挂载 Docker socket。若把 act 放进容器，推荐
   挂载宿主 socket（DooD）；DinD 需要自备 dockerd，且 CPU 编号、路径映射、清理边界
   都不同。放开 socket 后 workflow 创建的嵌套容器不计入上限（见 4.7）。
-- `act serve` 不判断失败是环境侧还是业务侧；它只提供 `status`/`result` 和日志。
-  类别结果由验证层生成，见 4.3.4。
+- `act serve` 不判断失败是环境侧还是业务侧；它只提供 `status`/`result` 和日志，
+  类别结果由外部验证/评分流程根据日志生成，见 4.3.4。
 - `--job-cpus` 只约束 job 容器，不约束 service 容器；host 模式（`-self-hosted`）
   的 job 直接在宿主机运行，也不受 CPU 配额/亲和性限制。
 - CPU 亲和性窗口按本进程可见的 CPU 列表轮转，默认假设 Docker daemon 与调度器
@@ -945,17 +939,15 @@ act submit \
 
 ---
 
-## 5. 多任务实测（fixbench）
+## 5. 多任务实测
 
-测试素材来自 `<fixbench 任务目录>` 下的
-真实任务实例：每个实例包含 `repo.tar.gz`（含 `.git`）、`task.json`
+测试素材来自一批真实的 CI 任务实例，每个实例包含 `repo.tar.gz`（含 `.git`）、`task.json`
 （`baseline_green` / `baseline_failing`）、`workflow.yml` 与 `event.json`。
 
 ### 5.1 环境
 
 - Docker 29.7.1（overlayfs），104 核 / 493G 内存。
-- runner 镜像：`catthehacker/ubuntu:act-latest`（5.2-5.4 的历史测试；当前部署的镜像
-  映射见 4.1）。
+- runner 镜像：`catthehacker/ubuntu:act-latest`（5.2-5.4 的历史测试）。
 - 5.2-5.4 的测试在引入 `--job-cpus` 之前运行，未设置 CPU 预算；当前默认值为 4，
   复现时任务耗时会不同，但上述并发/隔离结论不受影响。
 - 守护进程使用 **`go build -race`** 编译的二进制，`GORACE=log_path=... halt_on_error=0`，
@@ -1029,32 +1021,16 @@ export http_proxy=http://<proxy>:<port> https_proxy=http://<proxy>:<port>
 > 复现时注意：`workflow.yml` 应与实例目录中的版本一致（tar 内的 workflow 即该
 > commit 的版本）；`workdir` 必须是允许根目录下的绝对路径。
 
-### 5.6 当前部署验证（宿主机直跑）
+### 5.6 端到端验证样例
 
-当前线上形态与 5.2-5.4 的临时测试不同：act 直接在宿主机运行、调用宿主 dockerd，
-不使用 DinD；启动脚本的 `--max-containers` 默认 10、`--job-cpus 4`，本轮 campaign
-通过 `PACT_MAX_CONTAINERS=24` 设为 24，镜像映射见 4.1。用同一个 fixbench spectree
-实例（`test` / matrix `python-version=3.12`）验证：
+在宿主机直跑（act 调用宿主 dockerd，不使用 DinD）时，可用一个完整的 CI 任务实例验证 CPU 预算与隔离配置：
 
 - 运行结果 `success`；
-- job 容器镜像 `catthehacker/ubuntu:act-latest`；
 - `NanoCPUs=4e9`、`Cpuset=0-3`，容器内 `nproc=4`、`GOMAXPROCS=4`、
   `PYTEST_XDIST_AUTO_NUM_WORKERS=4`；
-- 本地 action（checkout-stub、setup-uv）正常命中，代理环境变量在 step 中生效。
-
-当前部署的其余特征：
-
-- act 是宿主机上的二进制进程（不是容器，也没有内层 dockerd）；
-- 工作目录根是 `/srv/ci/repos`；
-- 通过 `--container-options` 把 `/srv/ci/repos` 只读挂进 job 容器，并设置
-  `--container-options-policy auto`；
-- 使用 `--container-daemon-socket -`，job 容器内没有宿主 Docker socket；依赖 Docker
-  的 workflow 会失败，验证层将其归为环境侧；
-- 使用 `--action-offline-mode` + `--local-repository`，action 本身不依赖外网拉取；
-  workflow 步骤内部的下载（如 setup-uv 查询版本、pip/npm 安装）仍需要网络，当前
-  由 docker0 的宿主机透明代理完成，默认不注入显式 HTTP 代理变量；
-- `GITHUB_TOKEN` 通过 0600 的 secret 文件注入，`github.token`/`GH_TOKEN` 可用
-  （zizmor 等需要 token 的 action 已能通过）。
+- 使用 `--local-repository` 的 action 正常命中；
+- 使用 `--container-daemon-socket -` 时 job 内没有 Docker socket，依赖 Docker 的
+  workflow 会失败并被归为环境侧。
 
 该验证与 5.1 的 catthehacker 测试环境不同，结论以各自的镜像/代理配置为准。
 

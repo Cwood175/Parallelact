@@ -474,6 +474,10 @@ func (cr *containerReference) create(capAdd []string, capDrop []string) common.E
 		}
 
 		hostConfig := &container.HostConfig{
+			Resources: container.Resources{
+				NanoCPUs:   input.NanoCPUs,
+				CpusetCpus: input.CpusetCpus,
+			},
 			CapAdd:       capAdd,
 			CapDrop:      capDrop,
 			Binds:        input.Binds,

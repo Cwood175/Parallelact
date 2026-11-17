@@ -94,7 +94,7 @@ func execAsComposite(step actionStep) common.Executor {
 			return fmt.Errorf("missing steps in composite action")
 		}
 
-		ctx = WithCompositeLogger(ctx, &compositeRC.Masks)
+		ctx = WithCompositeLogger(ctx, compositeRC.Masks)
 
 		err := steps.main(ctx)
 
@@ -106,7 +106,7 @@ func execAsComposite(step actionStep) common.Executor {
 			}, eval.Interpolate(ctx, output.Value))
 		}
 
-		rc.Masks = append(rc.Masks, compositeRC.Masks...)
+		rc.ensureMasks().Append(compositeRC.ensureMasks().Snapshot()...)
 		rc.ExtraPath = compositeRC.ExtraPath
 		// compositeRC.Env is dirty, contains INPUT_ and merged step env, only rely on compositeRC.GlobalEnv
 		mergeIntoMap := mergeIntoMapCaseSensitive
@@ -196,7 +196,7 @@ func (rc *RunContext) compositeExecutor(action *model.Action) *compositeSteps {
 
 func (rc *RunContext) newCompositeCommandExecutor(executor common.Executor) common.Executor {
 	return func(ctx context.Context) error {
-		ctx = WithCompositeLogger(ctx, &rc.Masks)
+		ctx = WithCompositeLogger(ctx, rc.Masks)
 
 		// We need to inject a composite RunContext related command
 		// handler into the current running job container

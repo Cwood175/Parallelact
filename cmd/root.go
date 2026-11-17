@@ -17,7 +17,6 @@ import (
 	"github.com/adrg/xdg"
 	"github.com/andreaskoch/go-fswatch"
 	"github.com/joho/godotenv"
-	docker_container "github.com/moby/moby/api/types/container"
 	gitignore "github.com/sabhiram/go-gitignore"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -130,8 +129,11 @@ func createRootCommand(ctx context.Context, input *Input, version string) *cobra
 	rootCmd.PersistentFlags().BoolVarP(&input.useNewActionCache, "use-new-action-cache", "", false, "Enable using the new Action Cache for storing Actions locally")
 	rootCmd.PersistentFlags().StringArrayVarP(&input.localRepository, "local-repository", "", []string{}, "Replaces the specified repository and ref with a local folder (e.g. https://github.com/test/test@v0=/home/act/test or test/test@v0=/home/act/test, the latter matches any hosts or protocols)")
 	rootCmd.PersistentFlags().BoolVar(&input.listOptions, "list-options", false, "Print a json structure of compatible options")
-	rootCmd.PersistentFlags().IntVar(&input.concurrentJobs, "concurrent-jobs", 0, "Maximum number of concurrent jobs to run. Default is the number of CPUs available.")
+	rootCmd.PersistentFlags().IntVar(&input.concurrentJobs, "concurrent-jobs", 0, "Maximum number of concurrent jobs to run. Default is the number of CPUs available, capped by --job-cpus.")
+	rootCmd.PersistentFlags().IntVar(&input.jobCPUs, "job-cpus", 4, "CPU budget of every job container (quota, CPU affinity window and thread pool defaults). Set to 0 to disable the limit.")
 	rootCmd.PersistentFlags().Bool(trustProjectActrcFlag, false, "Apply every flag in ./.actrc. Without it, ./.actrc may only set flags that do not reach host resources, and $VAR references in it are not expanded. Set it on the command line or in your user config.")
+	rootCmd.AddCommand(createServeCommand(ctx, input))
+	rootCmd.AddCommand(createSubmitCommand(ctx, input))
 	rootCmd.SetArgs(args(rootCmd))
 	return rootCmd
 }
@@ -604,76 +606,18 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 		}
 
 		// run the plan
-		config := &runner.Config{
-			Actor:                              input.actor,
-			EventName:                          eventName,
-			EventPath:                          input.EventPath(),
-			DefaultBranch:                      defaultbranch,
-			ForcePull:                          !input.actionOfflineMode && input.forcePull,
-			ForceRebuild:                       input.forceRebuild,
-			ReuseContainers:                    input.reuseContainers,
-			Workdir:                            input.Workdir(),
-			ActionCacheDir:                     input.actionCachePath,
-			ActionOfflineMode:                  input.actionOfflineMode,
-			BindWorkdir:                        input.bindWorkdir,
-			LogOutput:                          !input.noOutput,
-			JSONLogger:                         input.jsonLogger,
-			LogPrefixJobID:                     input.logPrefixJobID,
-			Env:                                envs,
-			Secrets:                            secrets,
-			Vars:                               vars,
-			Inputs:                             inputs,
-			Token:                              secrets["GITHUB_TOKEN"],
-			InsecureSecrets:                    input.insecureSecrets,
-			Platforms:                          input.newPlatforms(),
-			Privileged:                         input.privileged,
-			UsernsMode:                         input.usernsMode,
-			ContainerArchitecture:              input.containerArchitecture,
-			ContainerDaemonSocket:              input.containerDaemonSocket,
-			ContainerOptions:                   input.containerOptions,
-			ContainerOptionsPolicy:             input.containerOptionsPolicy,
-			UseGitIgnore:                       input.useGitIgnore,
-			GitHubInstance:                     input.githubInstance,
-			ContainerCapAdd:                    input.containerCapAdd,
-			ContainerCapDrop:                   input.containerCapDrop,
-			AutoRemove:                         input.autoRemove,
-			ArtifactServerPath:                 input.artifactServerPath,
-			ArtifactServerAddr:                 artifactAddr,
-			ArtifactServerPort:                 input.artifactServerPort,
-			ArtifactServerAuthKey:              artifactServerAuthKey,
-			NoSkipCheckout:                     input.noSkipCheckout,
-			RemoteName:                         input.remoteName,
-			ReplaceGheActionWithGithubCom:      input.replaceGheActionWithGithubCom,
-			ReplaceGheActionTokenWithGithubCom: input.replaceGheActionTokenWithGithubCom,
-			Matrix:                             matrixes,
-			ContainerNetworkMode:               docker_container.NetworkMode(input.networkName),
-			ConcurrentJobs:                     input.concurrentJobs,
-		}
-		if input.useNewActionCache || len(input.localRepository) > 0 {
-			if input.actionOfflineMode {
-				config.ActionCache = &runner.GoGitActionCacheOfflineMode{
-					Parent: runner.GoGitActionCache{
-						Path: config.ActionCacheDir,
-					},
-				}
-			} else {
-				config.ActionCache = &runner.GoGitActionCache{
-					Path: config.ActionCacheDir,
-				}
-			}
-			if len(input.localRepository) > 0 {
-				localRepositories := map[string]string{}
-				for _, l := range input.localRepository {
-					k, v, _ := strings.Cut(l, "=")
-					localRepositories[k] = v
-				}
-				config.ActionCache = &runner.LocalRepositoryCache{
-					Parent:            config.ActionCache,
-					LocalRepositories: localRepositories,
-					CacheDirCache:     map[string]string{},
-				}
-			}
-		}
+		config := newRunnerConfig(runnerConfigInput{
+			input:                 input,
+			eventName:             eventName,
+			defaultBranch:         defaultbranch,
+			envs:                  envs,
+			secrets:               secrets,
+			vars:                  vars,
+			inputs:                inputs,
+			matrixes:              matrixes,
+			artifactAddr:          artifactAddr,
+			artifactServerAuthKey: artifactServerAuthKey,
+		})
 		r, err := runner.New(config)
 		if err != nil {
 			return err

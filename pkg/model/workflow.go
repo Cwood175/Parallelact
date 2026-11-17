@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/schema"
@@ -23,6 +24,8 @@ type Workflow struct {
 	Env      map[string]string `yaml:"env"`
 	Jobs     map[string]*Job   `yaml:"jobs"`
 	Defaults Defaults          `yaml:"defaults"`
+
+	initOnce sync.Once
 }
 
 // On events for the workflow
@@ -210,6 +213,51 @@ type Job struct {
 	With           map[string]interface{}    `yaml:"with"`
 	RawSecrets     yaml.Node                 `yaml:"secrets"`
 	Result         string
+
+	mu sync.RWMutex // guards Result and Outputs, which matrix instances share
+}
+
+// SetResult records the job result. A job is shared by all of its matrix
+// instances, which may finish concurrently, so access has to be synchronized.
+func (j *Job) SetResult(result string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Result = result
+}
+
+// GetResult returns the job result.
+func (j *Job) GetResult() string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.Result
+}
+
+// SetOutput replaces the job outputs.
+func (j *Job) SetOutputs(outputs map[string]string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Outputs = outputs
+}
+
+// SetOutput records a single job output.
+func (j *Job) SetOutput(name, value string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Outputs == nil {
+		j.Outputs = map[string]string{}
+	}
+	j.Outputs[name] = value
+}
+
+// GetOutputs returns a copy of the job outputs.
+func (j *Job) GetOutputs() map[string]string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	outputs := make(map[string]string, len(j.Outputs))
+	for k, v := range j.Outputs {
+		outputs[k] = v
+	}
+	return outputs
 }
 
 // Strategy for the job
@@ -724,14 +772,23 @@ func ReadWorkflow(in io.Reader, strict bool) (*Workflow, error) {
 
 // GetJob will get a job by name in the workflow
 func (w *Workflow) GetJob(jobID string) *Job {
-	for id, j := range w.Jobs {
-		if jobID == id {
+	w.initOnce.Do(func() {
+		// Fill in the defaults lazily but exactly once: jobs are read
+		// concurrently while a workflow runs.
+		for id, j := range w.Jobs {
+			if j == nil {
+				continue
+			}
 			if j.Name == "" {
 				j.Name = id
 			}
 			if j.If.Value == "" {
 				j.If.Value = "success()"
 			}
+		}
+	})
+	for id, j := range w.Jobs {
+		if jobID == id {
 			return j
 		}
 	}
@@ -748,7 +805,10 @@ func (w *Workflow) GetJobIDs() []string {
 }
 
 var OnDecodeNodeError = func(node yaml.Node, out interface{}, err error) {
-	log.Fatalf("Failed to decode node %v into %T: %v", node, out, err)
+	// A malformed or unresolved expression in one workflow must not terminate
+	// the long-running `act serve` scheduler.  Decode failures are reported and
+	// the affected field is treated as absent by its caller.
+	log.Errorf("Failed to decode node %v into %T: %v", node, out, err)
 }
 
 func decodeNode(node yaml.Node, out interface{}) bool {

@@ -1,0 +1,3 @@
+# Optional: defaults for the act CLI and `act serve`.
+# Copy to ~/.actrc or ./.actrc (not recommended to commit real values).
+-P ubuntu-latest=catthehacker/ubuntu:act-latest

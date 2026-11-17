@@ -35,3 +35,13 @@ unit-tests.xml
 
 # megalinter
 report/
+
+# Local deployment state and secrets
+.actrc
+.token
+.secrets
+*.proxy
+act.env
+data/
+artifacts/
+*.bak-*

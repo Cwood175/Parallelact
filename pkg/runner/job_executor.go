@@ -101,6 +101,11 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 		}
 	}
 
+	// Tracks the cleanup performed by the normal path, so the safety net below
+	// only runs when the body pipeline was skipped.
+	stopped := false
+	closed := false
+
 	var stopContainerExecutor common.Executor = func(ctx context.Context) error {
 		jobError := common.JobError(ctx)
 		var err error
@@ -113,7 +118,17 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 			logger.Infof("Cleaning up container for job %s", rc.JobName)
 			if err = info.stopContainer()(ctx); err != nil {
 				logger.Errorf("Error while stop job container: %v", err)
+			} else {
+				stopped = true
 			}
+		}
+		return err
+	}
+
+	closeContainerExecutor := func(ctx context.Context) error {
+		err := info.closeContainer()(ctx)
+		if err == nil {
+			closed = true
 		}
 		return err
 	}
@@ -129,57 +144,100 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 	pipeline = append(pipeline, preSteps...)
 	pipeline = append(pipeline, steps...)
 
-	return common.NewPipelineExecutor(
-		common.NewFieldExecutor("step", "Set up job", common.NewFieldExecutor("stepid", []string{"--setup-job"},
-			common.NewPipelineExecutor(common.NewInfoExecutor("\u2B50 Run Set up job"), info.startContainer(), rc.InitializeNodeTool()).
-				Then(common.NewFieldExecutor("stepResult", model.StepStatusSuccess, common.NewInfoExecutor("  \u2705  Success - Set up job"))).
-				ThenError(setJobError).OnError(common.NewFieldExecutor("stepResult", model.StepStatusFailure, common.NewInfoExecutor("  \u274C  Failure - Set up job"))))),
-		common.NewPipelineExecutor(pipeline...).
-			Finally(func(ctx context.Context) error { //nolint:contextcheck
-				var cancel context.CancelFunc
-				if ctx.Err() == context.Canceled {
-					// in case of an aborted run, we still should execute the
-					// post steps to allow cleanup.
-					ctx, cancel = context.WithTimeout(common.WithLogger(context.Background(), common.Logger(ctx)), 5*time.Minute)
-					defer cancel()
-				}
-				return postExecutor(ctx)
-			}).
-			Finally(common.NewFieldExecutor("step", "Complete job", common.NewFieldExecutor("stepid", []string{"--complete-job"},
-				common.NewInfoExecutor("\u2B50 Run Complete job").
-					Finally(stopContainerExecutor).
-					Finally(
-						info.interpolateOutputs().Finally(info.closeContainer()).Then(common.NewFieldExecutor("stepResult", model.StepStatusSuccess, common.NewInfoExecutor("  \u2705  Success - Complete job"))).
-							OnError(common.NewFieldExecutor("stepResult", model.StepStatusFailure, common.NewInfoExecutor("  \u274C  Failure - Complete job"))),
-					))))).Finally(setJobResultExecutor)
+	setupExecutor := common.NewFieldExecutor("step", "Set up job", common.NewFieldExecutor("stepid", []string{"--setup-job"},
+		common.NewPipelineExecutor(common.NewInfoExecutor("\u2B50 Run Set up job"), info.startContainer(), rc.InitializeNodeTool()).
+			Then(common.NewFieldExecutor("stepResult", model.StepStatusSuccess, common.NewInfoExecutor("  \u2705  Success - Set up job"))).
+			ThenError(setJobError).OnError(common.NewFieldExecutor("stepResult", model.StepStatusFailure, common.NewInfoExecutor("  \u274C  Failure - Set up job")))))
+
+	body := common.NewPipelineExecutor(pipeline...).
+		Finally(func(ctx context.Context) error { //nolint:contextcheck
+			var cancel context.CancelFunc
+			if ctx.Err() == context.Canceled {
+				// in case of an aborted run, we still should execute the
+				// post steps to allow cleanup.
+				ctx, cancel = context.WithTimeout(common.WithLogger(context.Background(), common.Logger(ctx)), 5*time.Minute)
+				defer cancel()
+			}
+			return postExecutor(ctx)
+		}).
+		Finally(common.NewFieldExecutor("step", "Complete job", common.NewFieldExecutor("stepid", []string{"--complete-job"},
+			common.NewInfoExecutor("\u2B50 Run Complete job").
+				Finally(stopContainerExecutor).
+				Finally(
+					info.interpolateOutputs().Finally(closeContainerExecutor).Then(common.NewFieldExecutor("stepResult", model.StepStatusSuccess, common.NewInfoExecutor("  \u2705  Success - Complete job"))).
+						OnError(common.NewFieldExecutor("stepResult", model.StepStatusFailure, common.NewInfoExecutor("  \u274C  Failure - Complete job"))),
+				))))
+
+	// The container cleanup lives on the outermost pipeline on purpose: when
+	// startContainer fails after `docker create` (cancelled run, start error),
+	// the body pipeline never runs, and a cleanup attached to it would leak the
+	// created container, its volumes and the job slot.
+	return common.NewPipelineExecutor(setupExecutor, body).
+		Finally(setJobResultExecutor).
+		Finally(func(ctx context.Context) error {
+			if stopped || !(rc.Config.AutoRemove || common.JobError(ctx) == nil) {
+				return nil
+			}
+			return cleanupAfterFailure("stop job container", info.stopContainer())(ctx)
+		}).
+		Finally(func(ctx context.Context) error {
+			if closed {
+				return nil
+			}
+			return cleanupAfterFailure("close job container", info.closeContainer())(ctx)
+		}).
+		Finally(rc.releaseJobSlot())
+}
+
+// cleanupAfterFailure runs a cleanup executor with a fresh context. Errors are
+// logged, not returned: they must not replace the job's real error. Leaked
+// resources are retried by the scheduler janitor.
+func cleanupAfterFailure(name string, exec common.Executor) common.Executor {
+	return func(ctx context.Context) error {
+		//nolint:contextcheck
+		ctx, cancel := context.WithTimeout(common.WithLogger(context.Background(), common.Logger(ctx)), time.Minute)
+		defer cancel()
+		if err := exec(ctx); err != nil {
+			common.Logger(ctx).Debugf("%s cleanup failed: %v", name, err)
+		}
+		return nil
+	}
 }
 
 func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success bool) {
 	logger := common.Logger(ctx)
 
-	jobResult := "success"
-	// we have only one result for a whole matrix build, so we need
-	// to keep an existing result state if we run a matrix
-	if len(info.matrix()) > 0 && rc.Run.Job().Result != "" {
-		jobResult = rc.Run.Job().Result
+	legResult := "success"
+	if !success {
+		legResult = "failure"
 	}
 
+	// Job.Result is the *group* result: a matrix job is one job for needs and
+	// the final plan outcome, so one failed leg makes the whole group failed.
+	// The leg itself still succeeded and must be reported (and scored) as such;
+	// otherwise a matrix leg whose steps all passed is shown as "Job failed"
+	// just because a sibling leg failed.
+	jobResult := legResult
+	if len(info.matrix()) > 0 && rc.Run.Job().GetResult() != "" {
+		jobResult = rc.Run.Job().GetResult()
+	}
 	if !success {
 		jobResult = "failure"
 	}
 
 	info.result(jobResult)
+	rc.setLegResult(legResult)
 	if rc.caller != nil {
 		// set reusable workflow job result
 		rc.caller.runContext.result(jobResult)
 	}
 
 	jobResultMessage := "succeeded"
-	if jobResult != "success" {
+	if legResult != "success" {
 		jobResultMessage = "failed"
 	}
 
-	logger.WithField("jobResult", jobResult).Infof("\U0001F3C1  Job %s", jobResultMessage)
+	logger.WithField("jobResult", legResult).Infof("\U0001F3C1  Job %s", jobResultMessage)
 }
 
 func setJobOutputs(ctx context.Context, rc *RunContext) {
@@ -193,7 +251,7 @@ func setJobOutputs(ctx context.Context, rc *RunContext) {
 			callerOutputs[k] = ee.Interpolate(ctx, ee.Interpolate(ctx, v.Value))
 		}
 
-		rc.caller.runContext.Run.Job().Outputs = callerOutputs
+		rc.caller.runContext.Run.Job().SetOutputs(callerOutputs)
 	}
 }
 

@@ -49,8 +49,8 @@ func (rc *RunContext) NewExpressionEvaluatorWithEnv(ctx context.Context, env map
 
 		for _, needs := range jobNeeds {
 			using[needs] = exprparser.Needs{
-				Outputs: jobs[needs].Outputs,
-				Result:  jobs[needs].Result,
+				Outputs: jobs[needs].GetOutputs(),
+				Result:  jobs[needs].GetResult(),
 			}
 		}
 
@@ -64,7 +64,7 @@ func (rc *RunContext) NewExpressionEvaluatorWithEnv(ctx context.Context, env map
 				result := model.WorkflowCallResult{
 					Outputs: map[string]string{},
 				}
-				for k, v := range job.Outputs {
+				for k, v := range job.GetOutputs() {
 					result.Outputs[k] = v
 				}
 				workflowCallResult[jobName] = &result
@@ -135,8 +135,8 @@ func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step,
 	using := make(map[string]exprparser.Needs)
 	for _, needs := range jobNeeds {
 		using[needs] = exprparser.Needs{
-			Outputs: jobs[needs].Outputs,
-			Result:  jobs[needs].Result,
+			Outputs: jobs[needs].GetOutputs(),
+			Result:  jobs[needs].GetResult(),
 		}
 	}
 

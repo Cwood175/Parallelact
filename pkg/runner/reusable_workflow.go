@@ -39,7 +39,7 @@ func newRemoteReusableWorkflowExecutor(rc *RunContext) common.Executor {
 	}
 
 	return common.NewPipelineExecutor(
-		newMutexExecutor(cloneIfRequired(rc, *remoteReusableWorkflow, workflowDir)),
+		newMutexExecutor(workflowDir, cloneIfRequired(rc, *remoteReusableWorkflow, workflowDir)),
 		newReusableWorkflowExecutor(rc, workflowDir, fmt.Sprintf("./.github/workflows/%s", remoteReusableWorkflow.Filename)),
 	)
 }
@@ -79,14 +79,16 @@ func newActionCacheReusableWorkflowExecutor(rc *RunContext, filename string, rem
 	}
 }
 
-var (
-	executorLock sync.Mutex
-)
+// executorLocks holds one mutex per clone target, so that jobs which need
+// different repositories can clone concurrently.
+var executorLocks sync.Map // key -> *sync.Mutex
 
-func newMutexExecutor(executor common.Executor) common.Executor {
+func newMutexExecutor(key string, executor common.Executor) common.Executor {
+	lock, _ := executorLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := lock.(*sync.Mutex)
 	return func(ctx context.Context) error {
-		executorLock.Lock()
-		defer executorLock.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
 
 		return executor(ctx)
 	}

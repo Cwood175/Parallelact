@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/filecollector"
@@ -20,6 +21,8 @@ type LocalRepositoryCache struct {
 	Parent            ActionCache
 	LocalRepositories map[string]string
 	CacheDirCache     map[string]string
+
+	mu sync.RWMutex // guards CacheDirCache
 }
 
 func (l *LocalRepositoryCache) Fetch(ctx context.Context, cacheDir, url, ref, token string) (string, error) {
@@ -27,13 +30,13 @@ func (l *LocalRepositoryCache) Fetch(ctx context.Context, cacheDir, url, ref, to
 	logger.Debugf("LocalRepositoryCache fetch %s with ref %s", url, ref)
 	if dest, ok := l.LocalRepositories[fmt.Sprintf("%s@%s", url, ref)]; ok {
 		logger.Infof("LocalRepositoryCache matched %s with ref %s to %s", url, ref, dest)
-		l.CacheDirCache[fmt.Sprintf("%s@%s", cacheDir, ref)] = dest
+		l.setCacheDirCache(fmt.Sprintf("%s@%s", cacheDir, ref), dest)
 		return ref, nil
 	}
 	if purl, err := goURL.Parse(url); err == nil {
 		if dest, ok := l.LocalRepositories[fmt.Sprintf("%s@%s", strings.TrimPrefix(purl.Path, "/"), ref)]; ok {
 			logger.Infof("LocalRepositoryCache matched %s with ref %s to %s", url, ref, dest)
-			l.CacheDirCache[fmt.Sprintf("%s@%s", cacheDir, ref)] = dest
+			l.setCacheDirCache(fmt.Sprintf("%s@%s", cacheDir, ref), dest)
 			return ref, nil
 		}
 	}
@@ -44,7 +47,7 @@ func (l *LocalRepositoryCache) Fetch(ctx context.Context, cacheDir, url, ref, to
 func (l *LocalRepositoryCache) GetTarArchive(ctx context.Context, cacheDir, sha, includePrefix string) (io.ReadCloser, error) {
 	logger := common.Logger(ctx)
 	// sha is mapped to ref in fetch if there is a local override
-	if dest, ok := l.CacheDirCache[fmt.Sprintf("%s@%s", cacheDir, sha)]; ok {
+	if dest, ok := l.getCacheDirCache(fmt.Sprintf("%s@%s", cacheDir, sha)); ok {
 		logger.Infof("LocalRepositoryCache read cachedir %s with ref %s and subpath '%s' from %s", cacheDir, sha, includePrefix, dest)
 		if includePrefix != "" && !filepath.IsLocal(filepath.FromSlash(includePrefix)) {
 			return nil, fmt.Errorf("refusing to read %q outside of %q", includePrefix, dest)
@@ -100,4 +103,20 @@ func (l *LocalRepositoryCache) GetTarArchive(ctx context.Context, cacheDir, sha,
 	}
 	logger.Infof("LocalRepositoryCache not matched cachedir %s with Ref %s and subpath '%s'", cacheDir, sha, includePrefix)
 	return l.Parent.GetTarArchive(ctx, cacheDir, sha, includePrefix)
+}
+
+func (l *LocalRepositoryCache) setCacheDirCache(key, value string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.CacheDirCache == nil {
+		l.CacheDirCache = map[string]string{}
+	}
+	l.CacheDirCache[key] = value
+}
+
+func (l *LocalRepositoryCache) getCacheDirCache(key string) (string, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	value, ok := l.CacheDirCache[key]
+	return value, ok
 }

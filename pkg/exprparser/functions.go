@@ -261,7 +261,7 @@ func (impl *interperterImpl) jobSuccess() (bool, error) {
 	jobNeeds := impl.getNeedsTransitive(impl.config.Run.Job())
 
 	for _, needs := range jobNeeds {
-		if jobs[needs].Result != "success" {
+		if jobs[needs].GetResult() != "success" {
 			return false, nil
 		}
 	}
@@ -278,7 +278,7 @@ func (impl *interperterImpl) jobFailure() (bool, error) {
 	jobNeeds := impl.getNeedsTransitive(impl.config.Run.Job())
 
 	for _, needs := range jobNeeds {
-		if jobs[needs].Result == "failure" {
+		if jobs[needs].GetResult() == "failure" {
 			return true, nil
 		}
 	}

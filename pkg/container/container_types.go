@@ -34,6 +34,13 @@ type NewContainerInput struct {
 	NetworkAliases  []string
 	ExposedPorts    nat.PortSet
 	PortBindings    nat.PortMap
+	// NanoCPUs is the CPU quota of the container in nano CPUs (1 CPU = 1e9),
+	// zero means unlimited.
+	NanoCPUs int64
+	// CpusetCpus pins the container to a set of host CPUs, e.g. "0-3". It also
+	// changes what nproc and affinity aware runtimes report inside the
+	// container, which is what memory sizing worker pools usually look at.
+	CpusetCpus string
 }
 
 // UnsafeOptionsHint names the flag that lifts the restrictions on

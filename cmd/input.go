@@ -66,6 +66,7 @@ type Input struct {
 	validate                           bool
 	strict                             bool
 	concurrentJobs                     int
+	jobCPUs                            int
 }
 
 func (i *Input) resolve(path string) string {

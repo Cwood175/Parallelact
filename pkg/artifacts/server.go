@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -590,11 +591,23 @@ func newHandler(artifactPath string, authKey []byte) http.Handler {
 // An empty authKey rejects every bearer request. v4 upload and download URLs are
 // authorized by a per-process signature instead.
 func Serve(ctx context.Context, artifactPath string, addr string, port string, authKey []byte) context.CancelFunc {
+	cancel, err := ServeE(ctx, artifactPath, addr, port, authKey)
+	if err != nil {
+		// Serve keeps the historical behaviour of a fatal error: it cannot
+		// report a startup failure to its caller.
+		common.Logger(ctx).Fatal(err)
+	}
+	return cancel
+}
+
+// ServeE is like Serve but reports a failure to bind the listener instead of
+// terminating the process, and has bound the port when it returns.
+func ServeE(ctx context.Context, artifactPath string, addr string, port string, authKey []byte) (context.CancelFunc, error) {
 	serverContext, cancel := context.WithCancel(ctx)
 	logger := common.Logger(serverContext)
 
 	if artifactPath == "" {
-		return cancel
+		return cancel, nil
 	}
 
 	logger.Debugf("Artifacts base path '%s'", artifactPath)
@@ -608,11 +621,17 @@ func Serve(ctx context.Context, artifactPath string, addr string, port string, a
 		Handler:           newHandler(artifactPath, authKey),
 	}
 
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to start artifact server on %s: %w", server.Addr, err)
+	}
+
 	// run server
 	go func() {
-		logger.Infof("Start server on http://%s:%s", addr, port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal(err)
+		logger.Infof("Start server on http://%s", listener.Addr())
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			logger.Errorf("Artifact server stopped: %v", err)
 		}
 	}()
 
@@ -626,5 +645,5 @@ func Serve(ctx context.Context, artifactPath string, addr string, port string, a
 		}
 	}()
 
-	return cancel
+	return cancel, nil
 }

@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	git "github.com/go-git/go-git/v5"
@@ -27,6 +28,17 @@ type ActionCache interface {
 	GetTarArchive(ctx context.Context, cacheDir, sha, includePrefix string) (io.ReadCloser, error)
 }
 
+// actionFetchLocks serializes fetches into the same bare repository. Several
+// jobs of the same run (and of concurrent runs) may need the same action at the
+// same time, and go-git cannot initialize or fetch one repository concurrently.
+// Reads are not locked: objects are content addressed and never rewritten.
+var actionFetchLocks sync.Map // gitPath -> *sync.Mutex
+
+func actionFetchLock(gitPath string) *sync.Mutex {
+	lock, _ := actionFetchLocks.LoadOrStore(gitPath, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
 type GoGitActionCache struct {
 	Path string
 }
@@ -35,6 +47,10 @@ func (c GoGitActionCache) Fetch(ctx context.Context, cacheDir, url, ref, token s
 	logger := common.Logger(ctx)
 
 	gitPath := path.Join(c.Path, safeFilename(cacheDir)+".git")
+
+	lock := actionFetchLock(gitPath)
+	lock.Lock()
+	defer lock.Unlock()
 
 	logger.Infof("GoGitActionCache fetch %s with ref %s at %s", url, ref, gitPath)
 

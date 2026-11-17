@@ -395,6 +395,17 @@ func TestReadWorkflow_Strategy(t *testing.T) {
 	assert.Equal(t, job.Strategy.FailFast, false)
 }
 
+func TestMatrixInvalidDynamicValueDoesNotPanic(t *testing.T) {
+	var node yaml.Node
+	require.NoError(t, node.Encode(map[string]interface{}{
+		"python-version": "${{ fromJSON(needs.matrix.outputs.versions) }}",
+	}))
+	job := &Job{Strategy: &Strategy{RawMatrix: node}}
+	// The unresolved expression is not a list; decoding must report and return
+	// nil rather than terminating the process.
+	assert.Nil(t, job.Matrix())
+}
+
 func TestMatrixOnlyIncludes(t *testing.T) {
 	matrix := map[string][]interface{}{
 		"include": []interface{}{

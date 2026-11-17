@@ -27,6 +27,50 @@ Let's see it in action with a [sample repo](https://github.com/cplee/github-acti
 
 Please look at the [act user guide](https://nektosact.com) for more documentation.
 
+# Running many workflows in parallel (PACT)
+
+This fork adds **PACT**, a long-lived scheduler on top of act: it accepts run
+requests over HTTP and executes their job instances concurrently, one container
+per job instance, under a global container limit. Runs of different
+repositories and commits share one worker pool and one set of container slots,
+while `needs` stages stay serial inside a run.
+
+- Design and caller guide: [README.scheduler.md](README.scheduler.md)
+- Detailed mechanism (terms, cache, network, isolation, cleanup): [docs/mechanism.md](docs/mechanism.md)
+- Paper-style description (methodology, pipeline, performance): [docs/pact-paper.md](docs/pact-paper.md)
+- Compact API/flag reference: [docs/scheduler.md](docs/scheduler.md)
+
+```bash
+# build
+go build -o dist/local/act main.go
+
+# start a scheduler (all paths/ports are configurable, see deploy/)
+PACT_DATA_DIR=/var/lib/act-serve PACT_WORKDIR_ROOTS=/srv/ci/repos \
+  ./deploy/start-serve.sh
+
+# submit a local checkout and wait for the result
+act submit --addr http://127.0.0.1:8080 --workdir /srv/ci/repos/repo --event push --wait
+```
+
+What the fork adds on top of upstream act:
+
+- job-instance level scheduling (`ExpandRun` / `NewJobExecutor`) with a global
+  priority queue and a global container semaphore shared by all runs;
+- admission control, per-group `max-parallel` gates, FIFO/priority fairness;
+- run-scoped naming, per-run cache server, per-job toolcache volumes, CPU
+  budgets and thread-pool defaults for job containers;
+- an HTTP API with run/job state, log streaming (`offset`/`follow`) and counters;
+- a cleanup janitor that reclaims containers, volumes and networks left by
+  cancelled or crashed runs;
+- concurrency fixes inside act (job results, step IDs, action fetch, config
+  cloning).
+
+Deployment templates live in [deploy/](deploy/); `deploy/start-serve.sh` reads
+every path, port, image and limit from environment variables and never contains
+credentials. A typical deployment runs one binary on the host and talks to the
+host Docker daemon; putting act in a container works too (mount the host socket),
+but DinD changes CPU ids, path mapping and cleanup boundaries.
+
 # Support
 
 Need help? Ask in [discussions](https://github.com/nektos/act/discussions)!

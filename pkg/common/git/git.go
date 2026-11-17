@@ -28,7 +28,7 @@ var (
 	githubHTTPRegex     = gitHostHTTPRegex("github.com")
 	githubSSHRegex      = gitHostSSHRegex("github.com")
 
-	cloneLock sync.Mutex
+	cloneLocks sync.Map // target directory -> *sync.Mutex
 
 	ErrShortRef = errors.New("short SHA references are not supported")
 	ErrNoRepo   = errors.New("unable to find git repo")
@@ -316,8 +316,9 @@ func NewGitCloneExecutor(input NewGitCloneExecutorInput) common.Executor {
 		logger.Infof("  \u2601  git clone '%s' # ref=%s", input.URL, input.Ref)
 		logger.Debugf("  cloning %s to %s", input.URL, input.Dir)
 
-		cloneLock.Lock()
-		defer cloneLock.Unlock()
+		cloneMu := cloneLockFor(input.Dir)
+		cloneMu.Lock()
+		defer cloneMu.Unlock()
 
 		refName := plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", input.Ref))
 		r, err := CloneIfRequired(ctx, refName, input, logger)
@@ -427,4 +428,11 @@ func NewGitCloneExecutor(input NewGitCloneExecutorInput) common.Executor {
 		logger.Debugf("Checked out %s", input.Ref)
 		return nil
 	}
+}
+
+// cloneLockFor returns the mutex that serializes clones into one directory.
+// Different repositories can be cloned concurrently.
+func cloneLockFor(dir string) *sync.Mutex {
+	lock, _ := cloneLocks.LoadOrStore(dir, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }

@@ -1,0 +1,11 @@
+Parallelact (PACT)
+==================
+
+This project is a fork of nektos/act (https://github.com/nektos/act),
+Copyright (c) 2019, which is licensed under the MIT License.
+
+The parallel scheduler in pkg/scheduler/, the `act serve` / `act submit`
+commands (cmd/serve.go, cmd/submit.go), and the related runner extensions
+(`ExpandRun`, `NewJobExecutor`, container slots, CPU budgets, cleanup janitor)
+are additions on top of the upstream project and are distributed under the
+same MIT License. See LICENSE for the full text.

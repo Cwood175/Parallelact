@@ -1,0 +1,15 @@
+[Unit]
+Description=Parallel act scheduler
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ci
+EnvironmentFile=/etc/act/parallelact.env
+ExecStart=/opt/parallelact/deploy/start-serve.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

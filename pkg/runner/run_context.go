@@ -18,6 +18,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/go-connections/nat"
@@ -51,15 +53,37 @@ type RunContext struct {
 	JobName             string
 	ActionPath          string
 	Parent              *RunContext
-	Masks               []string
+	Masks               *MaskList
 	cleanUpJobContainer common.Executor
 	caller              *caller // job calling this RunContext (reusable workflows)
-	Cancelled           bool
+	cancelled           atomic.Bool
 	nodeToolFullPath    string
+	slotAcquired        atomic.Bool
+	resultMu            sync.RWMutex
+	legResult           string
+	cleanupMu           sync.Mutex
+	closeDone           bool
 }
 
+// AddMask adds a value that must not appear in the logs.
 func (rc *RunContext) AddMask(mask string) {
-	rc.Masks = append(rc.Masks, mask)
+	rc.ensureMasks().Add(mask)
+}
+
+func (rc *RunContext) ensureMasks() *MaskList {
+	if rc.Masks == nil {
+		rc.Masks = &MaskList{}
+	}
+	return rc.Masks
+}
+
+// IsCancelled reports whether the job is being cancelled.
+func (rc *RunContext) IsCancelled() bool {
+	return rc.cancelled.Load()
+}
+
+func (rc *RunContext) setCancelled(cancelled bool) {
+	rc.cancelled.Store(cancelled)
 }
 
 type MappableOutput struct {
@@ -75,6 +99,35 @@ func (rc *RunContext) String() string {
 		name = fmt.Sprintf("%s/%s", rc.caller.runContext.Name, name)
 	}
 	return name
+}
+
+// appendNetworkEnv copies proxy/toolchain settings into a container's base
+// environment.  Step-level env is still authoritative, but action runtimes and
+// child processes started by the container entrypoint need the proxy too.
+func appendNetworkEnv(envList []string, env map[string]string) []string {
+	seen := make(map[string]struct{}, len(envList))
+	for _, entry := range envList {
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			seen[entry[:i]] = struct{}{}
+		}
+	}
+	for k, v := range env {
+		upper := strings.ToUpper(k)
+		if !strings.Contains(upper, "PROXY") &&
+			upper != "NODE_USE_ENV_PROXY" &&
+			!strings.HasPrefix(upper, "GIT_") &&
+			!strings.HasPrefix(upper, "JAVA_TOOL_OPTIONS") &&
+			!strings.HasPrefix(upper, "GRADLE_OPTS") &&
+			!strings.HasPrefix(upper, "MAVEN_OPTS") {
+			continue
+		}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		envList = append(envList, k+"="+v)
+		seen[k] = struct{}{}
+	}
+	return envList
 }
 
 // GetEnv returns the env for the context
@@ -93,7 +146,48 @@ func (rc *RunContext) GetEnv() map[string]string {
 }
 
 func (rc *RunContext) jobContainerName() string {
-	return createContainerName("act", rc.String())
+	parts := make([]string, 0, 3)
+	parts = append(parts, "act")
+	if rc.Config.RunID != "" {
+		parts = append(parts, rc.Config.RunID)
+	}
+	parts = append(parts, rc.String())
+	return createContainerName(parts...)
+}
+
+func (rc *RunContext) toolCacheVolume() string {
+	if rc.Config.ToolCacheVolume != "" {
+		// A non-empty base means the scheduler asked for per-job isolation.
+		// Matrix legs of one run share RunID, so add a per-job suffix; otherwise
+		// concurrent legs install the same Node/Python/uv version into one volume
+		// and corrupt it.
+		return toolCacheVolumeFor(rc.Config.ToolCacheVolume, rc.jobContainerName())
+	}
+	return "act-toolcache"
+}
+
+func toolCacheVolumeFor(base, jobContainer string) string {
+	if base == "" {
+		return "act-toolcache"
+	}
+	sum := sha256.Sum256([]byte(jobContainer))
+	return base + "-" + hex.EncodeToString(sum[:8])
+}
+
+// setLegResult records the result of this matrix leg. Job.Result stays the
+// group result for needs/plan semantics, but logs and the scheduler need the
+// outcome of the individual leg.
+func (rc *RunContext) setLegResult(result string) {
+	rc.resultMu.Lock()
+	rc.legResult = result
+	rc.resultMu.Unlock()
+}
+
+// LegResult returns the result of this matrix leg ("" before it finished).
+func (rc *RunContext) LegResult() string {
+	rc.resultMu.RLock()
+	defer rc.resultMu.RUnlock()
+	return rc.legResult
 }
 
 // networkName return the name of the network which will be created by `act` automatically for job,
@@ -130,13 +224,14 @@ func getDockerDaemonSocketMountPath(daemonPath string) string {
 func (rc *RunContext) GetBindsAndMounts() ([]string, map[string]string) {
 	name := rc.jobContainerName()
 
-	if rc.Config.ContainerDaemonSocket == "" {
-		rc.Config.ContainerDaemonSocket = "/var/run/docker.sock"
+	daemonSocket := rc.Config.ContainerDaemonSocket
+	if daemonSocket == "" {
+		daemonSocket = "/var/run/docker.sock"
 	}
 
 	binds := []string{}
-	if rc.Config.ContainerDaemonSocket != "-" {
-		daemonPath := getDockerDaemonSocketMountPath(rc.Config.ContainerDaemonSocket)
+	if daemonSocket != "-" {
+		daemonPath := getDockerDaemonSocketMountPath(daemonSocket)
 		binds = append(binds, fmt.Sprintf("%s:%s", daemonPath, "/var/run/docker.sock"))
 	}
 
@@ -151,8 +246,8 @@ func (rc *RunContext) GetBindsAndMounts() ([]string, map[string]string) {
 		return binds, mounts
 	}
 	mounts := map[string]string{
-		"act-toolcache": "/opt/hostedtoolcache",
-		name + "-env":   ext.GetActPath(),
+		rc.toolCacheVolume(): "/opt/hostedtoolcache",
+		name + "-env":        ext.GetActPath(),
 	}
 
 	if job := rc.Run.Job(); job != nil {
@@ -284,6 +379,8 @@ func (rc *RunContext) startJobContainer() common.Executor {
 		envList = append(envList, fmt.Sprintf("%s=%s", "RUNNER_ARCH", container.RunnerArch(ctx)))
 		envList = append(envList, fmt.Sprintf("%s=%s", "RUNNER_TEMP", "/tmp"))
 		envList = append(envList, fmt.Sprintf("%s=%s", "LANG", "C.UTF-8")) // Use same locale as GitHub Actions
+		envList = withJobCPUEnv(envList, rc.Config.JobCPUs)
+		envList = appendNetworkEnv(envList, rc.Config.Env)
 
 		ext := container.LinuxContainerEnvironmentExtensions{}
 		restrictOptions, restrictJobOptions, err := rc.checkWorkflowContainerVolumes(ctx)
@@ -369,6 +466,20 @@ func (rc *RunContext) startJobContainer() common.Executor {
 					Then(container.NewDockerVolumeRemoveExecutor(rc.jobContainerName(), false)).IfNot(reuseJobContainer).
 					Then(container.NewDockerVolumeRemoveExecutor(rc.jobContainerName()+"-env", false)).IfNot(reuseJobContainer).
 					Then(func(ctx context.Context) error {
+						volume := rc.toolCacheVolume()
+						if volume == "act-toolcache" {
+							// Shared toolcache must survive the job.
+							return nil
+						}
+						// Cleanup is best effort: the scheduler also sweeps
+						// per-run volumes, and a slow Docker volume delete must
+						// not turn a successful job into a failure.
+						if err := container.NewDockerVolumeRemoveExecutor(volume, false)(ctx); err != nil {
+							logger.Debugf("failed to remove tool cache volume %s: %v", volume, err)
+						}
+						return nil
+					}).IfNot(reuseJobContainer).
+					Then(func(ctx context.Context) error {
 						if len(rc.ServiceContainers) > 0 {
 							logger.Infof("Cleaning up services for job %s", rc.JobName)
 							if err := rc.stopServiceContainers()(ctx); err != nil {
@@ -398,6 +509,8 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			jobContainerNetwork = "host"
 		}
 
+		nanoCPUs, cpuset := jobContainerCPULimit(rc.Config.JobCPUs)
+
 		rc.JobContainer = container.NewContainer(&container.NewContainerInput{
 			Cmd:             nil,
 			Entrypoint:      []string{"tail", "-f", "/dev/null"},
@@ -418,6 +531,8 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			Platform:        rc.Config.ContainerArchitecture,
 			Options:         rc.options(ctx),
 			RestrictOptions: restrictJobOptions,
+			NanoCPUs:        nanoCPUs,
+			CpusetCpus:      cpuset,
 		})
 		if rc.JobContainer == nil {
 			return errors.New("Failed to create job container")
@@ -561,10 +676,12 @@ func (rc *RunContext) UpdateExtraPath(ctx context.Context, githubEnvPath string)
 // stopJobContainer removes the job container (if it exists) and its volume (if it exists)
 func (rc *RunContext) stopJobContainer() common.Executor {
 	return func(ctx context.Context) error {
-		if rc.cleanUpJobContainer != nil {
-			return rc.cleanUpJobContainer(ctx)
+		rc.cleanupMu.Lock()
+		defer rc.cleanupMu.Unlock()
+		if rc.cleanUpJobContainer == nil {
+			return nil
 		}
-		return nil
+		return rc.cleanUpJobContainer(ctx)
 	}
 }
 
@@ -660,10 +777,10 @@ func (rc *RunContext) ActionCacheDir() string {
 func (rc *RunContext) interpolateOutputs() common.Executor {
 	return func(ctx context.Context) error {
 		ee := rc.NewExpressionEvaluator(ctx)
-		for k, v := range rc.Run.Job().Outputs {
+		for k, v := range rc.Run.Job().GetOutputs() {
 			interpolated := ee.Interpolate(ctx, v)
 			if v != interpolated {
-				rc.Run.Job().Outputs[k] = interpolated
+				rc.Run.Job().SetOutput(k, interpolated)
 			}
 		}
 		return nil
@@ -672,12 +789,43 @@ func (rc *RunContext) interpolateOutputs() common.Executor {
 
 func (rc *RunContext) startContainer() common.Executor {
 	return func(ctx context.Context) error {
+		if err := rc.acquireJobSlot()(ctx); err != nil {
+			return err
+		}
 		ctx, cancel := common.EarlyCancelContext(ctx)
 		defer cancel()
 		if rc.IsHostEnv(ctx) {
 			return rc.startHostEnvironment()(ctx)
 		}
 		return rc.startJobContainer()(ctx)
+	}
+}
+
+// acquireJobSlot takes a slot from the global job limiter before any container
+// or network is created, so that the limit also covers matrix instances and
+// reusable workflow child jobs.
+func (rc *RunContext) acquireJobSlot() common.Executor {
+	return func(ctx context.Context) error {
+		if rc.Config.JobSlotLimiter == nil || common.Dryrun(ctx) {
+			return nil
+		}
+		if err := rc.Config.JobSlotLimiter.Acquire(ctx); err != nil {
+			return fmt.Errorf("failed to acquire a job slot: %w", err)
+		}
+		rc.slotAcquired.Store(true)
+		return nil
+	}
+}
+
+// releaseJobSlot returns the slot acquired by acquireJobSlot. It is called from
+// the job executor's unconditional cleanup, because container cleanup may be
+// skipped (for example when a job failed and AutoRemove is disabled).
+func (rc *RunContext) releaseJobSlot() common.Executor {
+	return func(context.Context) error {
+		if rc.Config.JobSlotLimiter != nil && rc.slotAcquired.CompareAndSwap(true, false) {
+			rc.Config.JobSlotLimiter.Release()
+		}
+		return nil
 	}
 }
 
@@ -693,10 +841,13 @@ func (rc *RunContext) stopContainer() common.Executor {
 
 func (rc *RunContext) closeContainer() common.Executor {
 	return func(ctx context.Context) error {
-		if rc.JobContainer != nil {
-			return rc.JobContainer.Close()(ctx)
+		rc.cleanupMu.Lock()
+		defer rc.cleanupMu.Unlock()
+		if rc.closeDone || rc.JobContainer == nil {
+			return nil
 		}
-		return nil
+		rc.closeDone = true
+		return rc.JobContainer.Close()(ctx)
 	}
 }
 
@@ -705,7 +856,7 @@ func (rc *RunContext) matrix() map[string]interface{} {
 }
 
 func (rc *RunContext) result(result string) {
-	rc.Run.Job().Result = result
+	rc.Run.Job().SetResult(result)
 }
 
 func (rc *RunContext) steps() []*model.Step {
@@ -928,7 +1079,7 @@ func trimToLen(s string, l int) string {
 
 func (rc *RunContext) getJobContext() *model.JobContext {
 	jobStatus := "success"
-	if rc.Cancelled {
+	if rc.IsCancelled() {
 		jobStatus = "cancelled"
 	} else {
 		for _, stepStatus := range rc.StepResults {
@@ -945,6 +1096,15 @@ func (rc *RunContext) getJobContext() *model.JobContext {
 
 func (rc *RunContext) getStepsContext() map[string]*model.StepResult {
 	return rc.StepResults
+}
+
+// githubSha prefers GITHUB_SHA and falls back to the historical SHA_REF env
+// name, so a scheduler can run any commit of a local checkout.
+func githubSha(env map[string]string) string {
+	if sha := env["GITHUB_SHA"]; sha != "" {
+		return sha
+	}
+	return env["SHA_REF"]
 }
 
 func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext {
@@ -969,7 +1129,7 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 		RunnerTrackingID: rc.Config.Env["RUNNER_TRACKING_ID"],
 		Repository:       rc.Config.Env["GITHUB_REPOSITORY"],
 		Ref:              rc.Config.Env["GITHUB_REF"],
-		Sha:              rc.Config.Env["SHA_REF"],
+		Sha:              githubSha(rc.Config.Env),
 		RefName:          rc.Config.Env["GITHUB_REF_NAME"],
 		RefType:          rc.Config.Env["GITHUB_REF_TYPE"],
 		BaseRef:          rc.Config.Env["GITHUB_BASE_REF"],
@@ -1224,12 +1384,13 @@ func (rc *RunContext) handleServiceCredentials(ctx context.Context, creds map[st
 
 // GetServiceBindsAndMounts returns the binds and mounts for the service container, resolving paths as appropriate
 func (rc *RunContext) GetServiceBindsAndMounts(svcVolumes []string) ([]string, map[string]string) {
-	if rc.Config.ContainerDaemonSocket == "" {
-		rc.Config.ContainerDaemonSocket = "/var/run/docker.sock"
+	daemonSocket := rc.Config.ContainerDaemonSocket
+	if daemonSocket == "" {
+		daemonSocket = "/var/run/docker.sock"
 	}
 	binds := []string{}
-	if rc.Config.ContainerDaemonSocket != "-" {
-		daemonPath := getDockerDaemonSocketMountPath(rc.Config.ContainerDaemonSocket)
+	if daemonSocket != "-" {
+		daemonPath := getDockerDaemonSocketMountPath(daemonSocket)
 		binds = append(binds, fmt.Sprintf("%s:%s", daemonPath, "/var/run/docker.sock"))
 	}
 

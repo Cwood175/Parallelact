@@ -37,28 +37,72 @@ func init() {
 	}
 }
 
+// NextJobLogColor returns the next color of the rotating job color palette.
+func NextJobLogColor() int {
+	mux.Lock()
+	defer mux.Unlock()
+	nextColor++
+	return colors[nextColor%len(colors)]
+}
+
+// MaskList is a concurrency safe set of values that must be masked in logs.
+type MaskList struct {
+	mu    sync.RWMutex
+	masks []string
+}
+
+// Add adds a mask.
+func (m *MaskList) Add(mask string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.masks = append(m.masks, mask)
+}
+
+// Append adds several masks.
+func (m *MaskList) Append(masks ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.masks = append(m.masks, masks...)
+}
+
+// Snapshot returns a copy of the current masks.
+func (m *MaskList) Snapshot() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]string(nil), m.masks...)
+}
+
 type masksContextKey string
 
 const masksContextKeyVal = masksContextKey("logrus.FieldLogger")
 
-// Logger returns the appropriate logger for current context
-func Masks(ctx context.Context) *[]string {
+// Masks returns the masks for the current context
+func Masks(ctx context.Context) []string {
 	val := ctx.Value(masksContextKeyVal)
 	if val != nil {
-		if masks, ok := val.(*[]string); ok {
-			return masks
+		if masks, ok := val.(*MaskList); ok && masks != nil {
+			return masks.Snapshot()
 		}
 	}
-	return &[]string{}
+	return nil
 }
 
 // WithMasks adds a value to the context for the logger
-func WithMasks(ctx context.Context, masks *[]string) context.Context {
+func WithMasks(ctx context.Context, masks *MaskList) context.Context {
 	return context.WithValue(ctx, masksContextKeyVal, masks)
 }
 
 type JobLoggerFactory interface {
 	WithJobLogger() *logrus.Logger
+}
+
+// NamedJobLoggerFactory is an optional extension of JobLoggerFactory. When a
+// factory implements it, child jobs of reusable workflows get their own logger
+// instead of sharing the caller's one. Implementations must return a fresh
+// logger for every call.
+type NamedJobLoggerFactory interface {
+	JobLoggerFactory
+	WithJobLoggerNamed(jobID, jobName string) *logrus.Logger
 }
 
 type jobLoggerFactoryContextKey string
@@ -70,24 +114,23 @@ func WithJobLoggerFactory(ctx context.Context, factory JobLoggerFactory) context
 }
 
 // WithJobLogger attaches a new logger to context that is aware of steps
-func WithJobLogger(ctx context.Context, jobID string, jobName string, config *Config, masks *[]string, matrix map[string]interface{}) context.Context {
+func WithJobLogger(ctx context.Context, jobID string, jobName string, config *Config, masks *MaskList, matrix map[string]interface{}) context.Context {
+	if masks == nil {
+		masks = &MaskList{}
+	}
 	ctx = WithMasks(ctx, masks)
 
 	var logger *logrus.Logger
-	if jobLoggerFactory, ok := ctx.Value(jobLoggerFactoryContextKeyVal).(JobLoggerFactory); ok && jobLoggerFactory != nil {
+	if jobLoggerFactory, ok := ctx.Value(jobLoggerFactoryContextKeyVal).(NamedJobLoggerFactory); ok && jobLoggerFactory != nil {
+		logger = jobLoggerFactory.WithJobLoggerNamed(jobID, jobName)
+	} else if jobLoggerFactory, ok := ctx.Value(jobLoggerFactoryContextKeyVal).(JobLoggerFactory); ok && jobLoggerFactory != nil {
 		logger = jobLoggerFactory.WithJobLogger()
 	} else {
 		var formatter logrus.Formatter
 		if config.JSONLogger {
 			formatter = &logrus.JSONFormatter{}
 		} else {
-			mux.Lock()
-			defer mux.Unlock()
-			nextColor++
-			formatter = &jobLogFormatter{
-				color:          colors[nextColor%len(colors)],
-				logPrefixJobID: config.LogPrefixJobID,
-			}
+			formatter = NewJobLogFormatter(NextJobLogColor(), config.LogPrefixJobID)
 		}
 
 		logger = logrus.New()
@@ -110,7 +153,7 @@ func WithJobLogger(ctx context.Context, jobID string, jobName string, config *Co
 	return common.WithLogger(ctx, rtn)
 }
 
-func WithCompositeLogger(ctx context.Context, masks *[]string) context.Context {
+func WithCompositeLogger(ctx context.Context, masks *MaskList) context.Context {
 	ctx = WithMasks(ctx, masks)
 	return common.WithLogger(ctx, common.Logger(ctx).WithFields(logrus.Fields{}).WithContext(ctx))
 }
@@ -161,7 +204,7 @@ func valueMasker(insecureSecrets bool, secrets map[string]string) entryProcessor
 			}
 		}
 
-		for _, v := range *masks {
+		for _, v := range masks {
 			if v != "" {
 				entry.Message = strings.ReplaceAll(entry.Message, v, "***")
 			}
@@ -183,6 +226,17 @@ func (f *maskedFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 type jobLogFormatter struct {
 	color          int
 	logPrefixJobID bool
+	forceColor     bool
+}
+
+// NewJobLogFormatter returns a formatter that renders entries the same way the
+// CLI does. forceColor makes sure the output keeps its colors on writers that
+// are not terminals (for example io.MultiWriter).
+func NewJobLogFormatter(color int, logPrefixJobID bool) logrus.Formatter {
+	return &jobLogFormatter{
+		color:          color,
+		logPrefixJobID: logPrefixJobID,
+	}
 }
 
 func (f *jobLogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
@@ -253,6 +307,10 @@ func (f *jobLogFormatter) print(b *bytes.Buffer, entry *logrus.Entry) {
 }
 
 func (f *jobLogFormatter) isColored(entry *logrus.Entry) bool {
+	if f.forceColor {
+		return true
+	}
+
 	isColored := checkIfTerminal(entry.Logger.Out)
 
 	if force, ok := os.LookupEnv("CLICOLOR_FORCE"); ok && force != "0" {
